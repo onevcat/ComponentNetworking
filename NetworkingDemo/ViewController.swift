@@ -156,13 +156,8 @@ struct HTTPClient {
     {
         let urlRequest = request.buildRequest()
 
-        IndicatorManager.increase()
         let task = session.dataTask(with: urlRequest) {
             data, response, error in
-
-//            DispatchQueue.main.async {
-//                IndicatorManager.decrease()
-//            }
 
             if let error = error {
                 handler(.failure(error))
@@ -221,9 +216,17 @@ struct HTTPClient {
 
     func send<Req: Request>(
         _ request: Req,
+        decisions: [Decision]? = nil,
         handler: @escaping (Result<Req.Response, Error>) -> Void)
     {
-        let urlRequest = request.buildRequest()
+        let urlRequest: URLRequest
+        do {
+            urlRequest = try request.buildRequest()
+        } catch {
+            handler(.failure(error))
+            return
+        }
+
         let task = session.dataTask(with: urlRequest) {
             data, response, error in
 
@@ -232,25 +235,72 @@ struct HTTPClient {
                 return
             }
 
-            do {
-                let value = try decoder.decode(Req.Response.self, from: data)
-                handler(.success(value))
-            } catch {
-                handler(.failure(error))
+            guard let response = response as? HTTPURLResponse else {
+                handler(.failure(ResponseError.nonHTTPResponse))
+                return
             }
+
+            self.handleDecision(request, data: data, response: response, decisions: decisions ?? request.decisions, handler: handler)
         }
         task.resume()
     }
+
+    func handleDecision<Req: Request>(_ request: Req, data: Data, response: HTTPURLResponse, decisions: [Decision], handler: @escaping (Result<Req.Response, Error>) -> Void) {
+        guard !decisions.isEmpty else { fatalError("No decision left but did not reach a stop.") }
+
+        var decisions = decisions
+        let current = decisions.removeFirst()
+        if current.shouldApply(request: request, data: data, response: response) {
+            current.apply(request: request, data: data, response: response) { action in
+                switch action {
+                case .continueWith(let data, let response):
+                    self.handleDecision(request, data: data, response: response, decisions: decisions, handler: handler)
+                case .restartWith(let decisions):
+                    self.send(request, decisions: decisions, handler: handler)
+                case .errored(let error):
+                    handler(.failure(error))
+                case .done(let value):
+                    handler(.success(value))
+                }
+            }
+        } else {
+            handleDecision(request, data: data, response: response, decisions: decisions, handler: handler)
+        }
+    }
+
 }
 
 enum HTTPMethod: String {
     case GET
     case POST
+
+    var adapter: AnyAdapter {
+        return AnyAdapter { req in
+            var req = req
+            req.httpMethod = self.rawValue
+            return req
+        }
+    }
 }
 
 enum ContentType: String {
     case json = "application/json"
     case urlForm = "application/x-www-form-urlencoded; charset=utf-8"
+
+    var headerAdapter: AnyAdapter {
+        return AnyAdapter { req in
+            var req = req
+            req.setValue(self.rawValue, forHTTPHeaderField: "Content-Type")
+            return req
+        }
+    }
+
+    func dataAdapter(for data: [String: Any]) -> RequestAdapter {
+        switch self {
+        case .json: return JSONRequestDataAdapter(data: data)
+        case .urlForm: return URLFormRequestDataAdapter(data: data)
+        }
+    }
 }
 
 protocol Request {
@@ -261,36 +311,34 @@ protocol Request {
     var method: HTTPMethod { get }
     var parameters: [String: Any] { get }
     var contentType: ContentType { get }
+
+    var adapters: [RequestAdapter] { get }
+    var decisions: [Decision] { get }
 }
 
 extension Request {
-    func buildRequest() -> URLRequest {
-        var request = URLRequest(url: url)
-        request.httpMethod = method.rawValue
 
-        if method == .GET {
-            var components = URLComponents(
-                url: url,
-                resolvingAgainstBaseURL: false)!
-            components.queryItems = parameters.map {
-                URLQueryItem(name: $0.key, value: $0.value as? String)
-            }
-            request.url = components.url
-        } else {
-            if contentType.rawValue.contains("application/json") {
-                request.httpBody = try? JSONSerialization
-                    .data(withJSONObject: parameters, options: [])
-            } else if contentType.rawValue.contains("application/x-www-form-urlencoded") {
-                request.httpBody = parameters
-                    .map { "\($0.key)=\($0.value)" }
-                    .joined(separator: "&")
-                    .data(using: .utf8)
-            } else {
-                //...
-            }
-        }
+    var adapters: [RequestAdapter] {
+        return [
+            method.adapter,
+            RequestContentAdapter(method: method, contentType: contentType, content: parameters)
+        ]
+    }
 
-        return request
+    var decisions: [Decision] { return [
+        RefreshTokenDecision(),
+        RetryDecision(leftCount: 2),
+        BadResponseStatusCodeDecision(),
+        DataMappingDecision(condition: { $0.isEmpty }) { _ in
+            return "{}".data(using: .utf8)!
+        },
+        ParseResultDecision()
+        ]
+    }
+
+    func buildRequest() throws -> URLRequest {
+        let request = URLRequest(url: url)
+        return try adapters.reduce(request) { try $1.adapted($0) }
     }
 }
 
@@ -347,3 +395,196 @@ struct HTTPResponse<T: Codable> {
     }
 }
 
+protocol RequestAdapter {
+    func adapted(_ request: URLRequest) throws -> URLRequest
+}
+
+struct AnyAdapter: RequestAdapter {
+    let block: (URLRequest) throws -> URLRequest
+    func adapted(_ request: URLRequest) throws -> URLRequest {
+        return try block(request)
+    }
+}
+
+struct RequestContentAdapter: RequestAdapter {
+
+    let method: HTTPMethod
+    let contentType: ContentType
+    let content: [String: Any]
+
+    func adapted(_ request: URLRequest) throws -> URLRequest {
+        switch method {
+        case .GET:
+            return try URLQueryDataAdapter(data: content).adapted(request)
+        case .POST:
+            let headerAdapter = contentType.headerAdapter
+            let dataAdapter = contentType.dataAdapter(for: content)
+            let req = try headerAdapter.adapted(request)
+            return try dataAdapter.adapted(req)
+        }
+    }
+}
+
+struct URLQueryDataAdapter: RequestAdapter {
+    let data: [String: Any]
+    func adapted(_ request: URLRequest) throws -> URLRequest {
+        fatalError("Not implemented yet.")
+    }
+}
+
+struct JSONRequestDataAdapter: RequestAdapter {
+    let data: [String: Any]
+    func adapted(_ request: URLRequest) throws -> URLRequest {
+        var request = request
+        request.httpBody = try JSONSerialization.data(withJSONObject: data, options: [])
+        return request
+    }
+}
+
+struct URLFormRequestDataAdapter: RequestAdapter {
+    let data: [String: Any]
+    func adapted(_ request: URLRequest) throws -> URLRequest {
+        var request = request
+        request.httpBody =
+            data.map { "\($0.key)=\($0.value)" }
+                .joined(separator: "&")
+                .data(using: .utf8)
+        return request
+    }
+}
+
+protocol Decision {
+    func shouldApply<Req: Request>(request: Req, data: Data, response: HTTPURLResponse) -> Bool
+    func apply<Req: Request>(
+        request: Req,
+        data: Data,
+        response: HTTPURLResponse,
+        done closure: @escaping (DecisionAction<Req>) -> Void)
+}
+
+enum DecisionAction<Req: Request> {
+    case continueWith(Data, HTTPURLResponse)
+    case restartWith([Decision])
+    case errored(Error)
+    case done(Req.Response)
+}
+
+struct DataMappingDecision: Decision {
+
+    let condition: (Data) -> Bool
+    let transform: (Data) -> Data
+
+    init(condition: @escaping ((Data) -> Bool), transform: @escaping (Data) -> Data) {
+        self.transform = transform
+        self.condition = condition
+    }
+
+    func shouldApply<Req: Request>(request: Req, data: Data, response: HTTPURLResponse) -> Bool {
+        return condition(data)
+    }
+
+    func apply<Req: Request>(
+        request: Req,
+        data: Data, response: HTTPURLResponse,
+        done closure: @escaping (DecisionAction<Req>) -> Void)
+    {
+        closure(.continueWith(transform(data), response))
+    }
+}
+
+let client = HTTPClient(session: .shared)
+
+struct RefreshTokenDecision: Decision {
+
+    func shouldApply<Req: Request>(request: Req, data: Data, response: HTTPURLResponse) -> Bool {
+        return response.statusCode == 403
+    }
+
+    func apply<Req: Request>(
+        request: Req,
+        data: Data,
+        response: HTTPURLResponse,
+        done closure: @escaping (DecisionAction<Req>) -> Void)
+    {
+        let refreshTokenRequest = RefreshTokenRequest(refreshToken: "abc123")
+        client.send(refreshTokenRequest) { result in
+            switch result {
+            case .success(_):
+                let decisionsWithoutRefresh = request.decisions.removing(self)
+                closure(.restartWith(decisionsWithoutRefresh))
+            case .failure(let error): closure(.errored(error))
+            }
+        }
+    }
+}
+
+struct ParseResultDecision: Decision {
+    func shouldApply<Req: Request>(request: Req, data: Data, response: HTTPURLResponse) -> Bool {
+        return true
+    }
+
+    func apply<Req: Request>(
+        request: Req,
+        data: Data,
+        response: HTTPURLResponse,
+        done closure: @escaping (DecisionAction<Req>) -> Void)
+    {
+        do {
+            let value = try decoder.decode(Req.Response.self, from: data)
+            closure(.done(value))
+        } catch {
+            closure(.errored(error))
+        }
+    }
+}
+
+struct RetryDecision: Decision {
+    let leftCount: Int
+    func shouldApply<Req: Request>(request: Req, data: Data, response: HTTPURLResponse) -> Bool {
+        let isStatusCodeValid = (200..<300).contains(response.statusCode)
+        return !isStatusCodeValid && leftCount > 0
+    }
+
+    func apply<Req: Request>(
+        request: Req,
+        data: Data,
+        response: HTTPURLResponse,
+        done closure: @escaping (DecisionAction<Req>) -> Void)
+    {
+        let retryDecision = RetryDecision(leftCount: leftCount - 1)
+        let newDecisions = request.decisions.replacing(self, with: retryDecision)
+        closure(.restartWith(newDecisions))
+    }
+}
+
+struct BadResponseStatusCodeDecision: Decision {
+    func shouldApply<Req: Request>(request: Req, data: Data, response: HTTPURLResponse) -> Bool {
+        return !(200..<300).contains(response.statusCode)
+    }
+
+    func apply<Req: Request>(
+        request: Req,
+        data: Data,
+        response: HTTPURLResponse,
+        done closure: @escaping (DecisionAction<Req>) -> Void)
+    {
+        do {
+            let value = try decoder.decode(APIError.self, from: data)
+            closure(.errored(ResponseError.apiError(error: value, statusCode: response.statusCode)))
+        } catch {
+            closure(.errored(error))
+        }
+    }
+}
+
+extension Array where Element == Decision {
+    func removing(_ item: Decision) -> Array {
+        print("Not implemented yet.")
+        return self
+    }
+
+    func replacing(_ item: Decision, with: Decision?) -> Array {
+        print("Not implemented yet.")
+        return self
+    }
+}
