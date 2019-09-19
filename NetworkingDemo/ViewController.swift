@@ -14,7 +14,9 @@ class ViewController: UIViewController {
         super.viewDidLoad()
         // Do any additional setup after loading the view.
 
-        postWithClientRequest()
+        // post() // naive
+        // postWithClient() // good
+        postWithClientRequest() // better
     }
 
     func get() {
@@ -50,26 +52,6 @@ class ViewController: UIViewController {
         task.resume()
     }
 
-    struct HTTPBinPostResponse: Codable {
-        struct Form: Codable { let foo: String }
-        let form: Form
-    }
-
-    struct HTTPBinPostRequest: Request {
-
-        typealias Response = HTTPBinPostResponse
-
-        let url = URL(string: "https://httpbin.org/post")!
-        let method = HTTPMethod.POST
-        let contentType = ContentType.urlForm
-
-        var parameters: [String : Any] {
-            return ["foo": foo]
-        }
-
-        let foo: String
-    }
-
     func postWithClient() {
         let client = HTTPClient(session: .shared)
         let request = HTTPRequest(
@@ -94,54 +76,61 @@ class ViewController: UIViewController {
     }
 }
 
-enum ResponseError: Error {
-    case nilData
-    case nonHTTPResponse
-    case tokenError
-    case apiError(error: APIError, statusCode: Int)
-}
+// MARK: - Plain Request
 
-struct APIError: Decodable {
-    let code: Int
-    let reason: String
-}
+// naive
+struct HTTPRequest {
 
+    let url: URL
+    let method: String
+    let parameters: [String: Any]
+    let headers: [String: String]
 
-struct RefreshTokenRequest: Request {
+    func buildRequest() -> URLRequest {
+        var request = URLRequest(url: url)
+        request.httpMethod = method
 
-    struct Response: Decodable {
-        let token: String
-    }
+        request.allHTTPHeaderFields = headers
 
-    let url = URL(string: "someurl")!
-    let method: HTTPMethod = .POST
-    let contentType: ContentType = .json
-
-    var parameters: [String : Any] {
-        return ["refreshToken": refreshToken]
-    }
-
-    let refreshToken: String
-
-}
-
-class IndicatorManager {
-    static var currentCount = 0
-    static func increase() {
-        currentCount += 1
-        if currentCount >= 0 {
-            UIApplication.shared
-                .isNetworkActivityIndicatorVisible = true
+        if method == "GET" {
+            var components = URLComponents(
+                url: url,
+                resolvingAgainstBaseURL: false)!
+            components.queryItems = parameters.map {
+                URLQueryItem(name: $0.key, value: $0.value as? String)
+            }
+            request.url = components.url
+        } else {
+            if headers["Content-Type"] == "application/json" {
+                request.httpBody = try? JSONSerialization
+                    .data(withJSONObject: parameters, options: [])
+            } else if headers["Content-Type"] == "application/x-www-form-urlencoded" {
+                request.httpBody = parameters
+                    .map { "\($0.key)=\($0.value)" }
+                    .joined(separator: "&")
+                    .data(using: .utf8)
+            } else {
+                //...
+            }
         }
-    }
-    static func decrease() {
-        currentCount = max(0, currentCount - 1)
-        if currentCount == 0 {
-            UIApplication.shared
-                .isNetworkActivityIndicatorVisible = false
-        }
+
+        return request
     }
 }
+
+struct HTTPResponse<T: Codable> {
+    let value: T?
+    let response: HTTPURLResponse?
+    let error: Error?
+
+    init(data: Data?, response: URLResponse?, error: Error?) throws {
+        self.value = try data.map { try decoder.decode(T.self, from: $0) }
+        self.response = response as? HTTPURLResponse
+        self.error = error
+    }
+}
+
+// MARK: - Client
 
 struct HTTPClient {
 
@@ -150,6 +139,7 @@ struct HTTPClient {
         self.session = session
     }
 
+    // naive
     func send<T: Codable>(
         _ request: HTTPRequest,
         handler: @escaping (Result<T, Error>) -> Void)
@@ -181,7 +171,7 @@ struct HTTPClient {
                         let freshTokenRequest = RefreshTokenRequest(refreshToken: "token123")
                         self.send(freshTokenRequest) { result in
                             switch result {
-                            case .success(let token):
+                            case .success(_): //(let token):
                                 // keyChain.saveToken(result)
                                 // Send current request again.
                                 self.send(request, handler: handler)
@@ -214,6 +204,7 @@ struct HTTPClient {
         task.resume()
     }
 
+    // better
     func send<Req: Request>(
         _ request: Req,
         decisions: [Decision]? = nil,
@@ -240,47 +231,75 @@ struct HTTPClient {
                 return
             }
 
-            self.handleDecision(request, data: data, response: response, decisions: decisions ?? request.decisions, handler: handler)
+            self.handleDecision(
+                request,
+                data: data,
+                response: response,
+                decisions: decisions ?? request.decisions,
+                handler: handler
+            )
         }
         task.resume()
     }
 
-    func handleDecision<Req: Request>(_ request: Req, data: Data, response: HTTPURLResponse, decisions: [Decision], handler: @escaping (Result<Req.Response, Error>) -> Void) {
-        guard !decisions.isEmpty else { fatalError("No decision left but did not reach a stop.") }
+    func handleDecision<Req: Request>(
+        _ request: Req,
+        data: Data,
+        response: HTTPURLResponse,
+        decisions: [Decision],
+        handler: @escaping (Result<Req.Response, Error>) -> Void)
+    {
+        guard !decisions.isEmpty else {
+            fatalError("No decision left but did not reach a stop.")
+        }
 
         var decisions = decisions
         let current = decisions.removeFirst()
-        if current.shouldApply(request: request, data: data, response: response) {
-            current.apply(request: request, data: data, response: response) { action in
-                switch action {
-                case .continueWith(let data, let response):
-                    self.handleDecision(request, data: data, response: response, decisions: decisions, handler: handler)
-                case .restartWith(let decisions):
-                    self.send(request, decisions: decisions, handler: handler)
-                case .errored(let error):
-                    handler(.failure(error))
-                case .done(let value):
-                    handler(.success(value))
-                }
-            }
-        } else {
+
+        guard current.shouldApply(request: request, data: data, response: response) else {
             handleDecision(request, data: data, response: response, decisions: decisions, handler: handler)
+            return
+        }
+
+        current.apply(request: request, data: data, response: response) { action in
+            switch action {
+            case .continueWith(let data, let response):
+                self.handleDecision(
+                    request, data: data, response: response, decisions: decisions, handler: handler)
+            case .restartWith(let decisions):
+                self.send(request, decisions: decisions, handler: handler)
+            case .errored(let error):
+                handler(.failure(error))
+            case .done(let value):
+                handler(.success(value))
+            }
         }
     }
-
 }
+
+// MARK: - Defs
+
+struct HTTPBinPostResponse: Codable {
+    struct Form: Codable { let foo: String }
+    let form: Form
+}
+
+enum ResponseError: Error {
+    case nilData
+    case nonHTTPResponse
+    case tokenError
+    case apiError(error: APIError, statusCode: Int)
+}
+
+struct APIError: Decodable {
+    let code: Int
+    let reason: String
+}
+
 
 enum HTTPMethod: String {
     case GET
     case POST
-
-    var adapter: AnyAdapter {
-        return AnyAdapter { req in
-            var req = req
-            req.httpMethod = self.rawValue
-            return req
-        }
-    }
 }
 
 enum ContentType: String {
@@ -302,6 +321,8 @@ enum ContentType: String {
         }
     }
 }
+
+// MARK: - Protocol-Based Request
 
 protocol Request {
 
@@ -342,58 +363,39 @@ extension Request {
     }
 }
 
-struct HTTPRequest {
+struct HTTPBinPostRequest: Request {
 
-    let url: URL
-    let method: String
-    let parameters: [String: Any]
-    let headers: [String: String]
+    typealias Response = HTTPBinPostResponse
 
-    func buildRequest() -> URLRequest {
-        var request = URLRequest(url: url)
-        request.httpMethod = method
+    let url = URL(string: "https://httpbin.org/post")!
+    let method = HTTPMethod.POST
+    let contentType = ContentType.urlForm
 
-        request.allHTTPHeaderFields = headers
-
-        if method == "GET" {
-            var components = URLComponents(
-                url: url,
-                resolvingAgainstBaseURL: false)!
-            components.queryItems = parameters.map {
-                URLQueryItem(name: $0.key, value: $0.value as? String)
-            }
-            request.url = components.url
-        } else {
-            if headers["Content-Type"] == "application/json" {
-                request.httpBody = try? JSONSerialization
-                    .data(withJSONObject: parameters, options: [])
-            } else if headers["Content-Type"] == "application/x-www-form-urlencoded" {
-                request.httpBody = parameters
-                    .map { "\($0.key)=\($0.value)" }
-                    .joined(separator: "&")
-                    .data(using: .utf8)
-            } else {
-                //...
-            }
-        }
-
-        return request
+    var parameters: [String : Any] {
+        return ["foo": foo]
     }
+
+    let foo: String
 }
 
-let decoder = JSONDecoder()
+struct RefreshTokenRequest: Request {
 
-struct HTTPResponse<T: Codable> {
-    let value: T?
-    let response: HTTPURLResponse?
-    let error: Error?
-
-    init(data: Data?, response: URLResponse?, error: Error?) throws {
-        self.value = try data.map { try decoder.decode(T.self, from: $0) }
-        self.response = response as? HTTPURLResponse
-        self.error = error
+    struct Response: Decodable {
+        let token: String
     }
+
+    let url = URL(string: "someurl")!
+    let method: HTTPMethod = .POST
+    let contentType: ContentType = .json
+
+    var parameters: [String : Any] {
+        return ["refreshToken": refreshToken]
+    }
+
+    let refreshToken: String
 }
+
+// MARK: - Adapters
 
 protocol RequestAdapter {
     func adapted(_ request: URLRequest) throws -> URLRequest
@@ -453,6 +455,19 @@ struct URLFormRequestDataAdapter: RequestAdapter {
     }
 }
 
+extension HTTPMethod {
+    var adapter: AnyAdapter {
+        return AnyAdapter { req in
+            var req = req
+            req.httpMethod = self.rawValue
+            return req
+        }
+    }
+}
+
+
+// MARK: - Decisions
+
 protocol Decision {
     func shouldApply<Req: Request>(request: Req, data: Data, response: HTTPURLResponse) -> Bool
     func apply<Req: Request>(
@@ -493,7 +508,6 @@ struct DataMappingDecision: Decision {
 }
 
 let client = HTTPClient(session: .shared)
-
 struct RefreshTokenDecision: Decision {
 
     func shouldApply<Req: Request>(request: Req, data: Data, response: HTTPURLResponse) -> Bool {
@@ -577,6 +591,8 @@ struct BadResponseStatusCodeDecision: Decision {
     }
 }
 
+// MARK: - Utils
+
 extension Array where Element == Decision {
     func removing(_ item: Decision) -> Array {
         print("Not implemented yet.")
@@ -588,3 +604,5 @@ extension Array where Element == Decision {
         return self
     }
 }
+
+let decoder = JSONDecoder()
